@@ -1,0 +1,56 @@
+(kicad_sch
+	(version 20250114)
+	(generator "eeschema")
+	(generator_version "9.0")
+	(uuid "8dc5ff01-0454-47f0-8fef-b92cd6726cbe")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 23.368 18.288)
+		(size 32.512 23.622)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "2d6af37a-78b4-4707-b88c-8ca3802ffa6f")
+		(property "Sheetname" "Transmitter"
+			(at 23.368 17.5764 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "transmitter.kicad_sch"
+			(at 23.368 42.4946 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "FinalLab"
+				(path "/8dc5ff01-0454-47f0-8fef-b92cd6726cbe"
+					(page "2")
+				)
+			)
+		)
+	)
+	(sheet_instances
+		(path "/"
+			(page "1")
+		)
+	)
+	(embedded_fonts no)
+)
