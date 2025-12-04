@@ -417,6 +417,10 @@
     [
       "2d6af37a-78b4-4707-b88c-8ca3802ffa6f",
       "Transmitter"
+    ],
+    [
+      "0a7651ff-5f66-443f-97c3-b173a124e8de",
+      "Reciever"
     ]
   ],
   "text_variables": {}
