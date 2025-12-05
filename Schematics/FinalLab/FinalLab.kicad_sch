@@ -25,7 +25,7 @@
 		)
 		(uuid "3d76f24f-d74c-4d3e-8b26-4580b373faab")
 	)
-	(text_box "Component List:\n----------------------------\nReceiver:\nArduino Uno R3\nNRF24L01 (2.4 Ghz Radio)\nDHT11\nTC74A0\nLDR\nI2C LCD\nStepper + ULN2003\nL293D\nDC Motor"
+	(text_box "Component List:\n----------------------------\nReceiver:\nArduino Uno R3\nNRF24L01 (2.4 Ghz Radio)\nDHT11\nLDR\nI2C LCD\nL293D\nDC Motor"
 		(exclude_from_sim no)
 		(at 57.15 55.88 0)
 		(size 59.436 26.67)

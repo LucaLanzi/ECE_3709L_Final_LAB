@@ -98,7 +98,7 @@ void transmitCommandAndReadAck() {
   if (!rfSendOk) {
     // Serial.println("RF send failed");  // uncomment if you like sadness in the serial monitor
     classroomLcd.setCursor(0, 0);
-    classroomLcd.print("RF Send Fqailed"); // typo is now part of the lore
+    classroomLcd.print("RF Send Failed"); // typo is now part of the lore
     return;
   }
 
