@@ -1,162 +1,298 @@
-#include <SPI.h>
-#include <RF24.h>
-#include <nRF24L01.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#define LCD_ADDRESS 0x27   // too scared to touch this macro tbh
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <DHT11.h>
 
-#define LCD_ADDRESS 0x27
-LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
+// ================== pin assignments ==================
+// L293D motor driver pins
+const int motorIn1Pin = 3;
+const int motorIn2Pin = 9;
+const int motorEnablePin = 5;
 
-enum State : uint8_t { IDLE = 0, FWD, BWD, STOP };
+// pushbutton pins (active LOW)
+const int buttonStartPin = 4;
+const int buttonPidPin = 6;
+const int buttonStopPin = 10;
 
-// Radio Setup
-const int CE = 7, CSN = 8;
-RF24 radio(CE, CSN);
-const byte address[6] = "P2U80";
-uint8_t payload = 0;
+// light sensor pin
+const int ldrAnalogPin = A2;
 
-// --- Added: store the current latched state ---
-State currentState = STOP;
+// DHT11 on digital pin 2
+DHT11 myDht11Sensor(2);
 
-unsigned long lastRx = 0;
-const unsigned long rxTimeoutMs = 500;
+// ================== timing / debounce stuff ==================
+const unsigned long pidSampleTimeMs = 50;      // PID measurement every 50 ms (lab said so)
+const unsigned long buttonSampleTimeMs = 50;   // debounce button 50 ms (pls no ghost presses)
+const unsigned long displayRefreshTimeMs = 15; // update display every 15 ms (>60Hz, gaming LCD)
 
-// Stepper motor pins
-#define IN1 9
-#define IN2 5
-#define IN3 6
-#define IN4 3
+unsigned long lastPidTimestamp = 0;       // store last PID update time
+unsigned long lastButtonTimestamp = 0;    // store last button check time
+unsigned long lastDisplayTimestamp = 0;   // store last LCD update time
 
-int Steps = 0;
+// ================== sensor values ==================
+int dhtTemperatureF = 0;
+int dhtHumidityPercent = 0;
+int ldrLightReading = 0;
 
-// === Function: run the stepper ===
-// direction = true  → forward
-// direction = false → backward
-// steps     = number of microsteps (default 4096 = full revolution for 28BYJ-48)
-// delayUs   = delay between steps (speed control)
-void runStepper(bool direction, int steps = 4096, int delayUs = 200) {
-  for (int i = 0; i < steps; i++) {
-    // Output sequence for 8-step half stepping
-    switch (Steps) {
-      case 0: digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); break;
-      case 1: digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);  digitalWrite(IN3, HIGH); digitalWrite(IN4, HIGH); break;
-      case 2: digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  break;
-      case 3: digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  break;
-      case 4: digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);  break;
-      case 5: digitalWrite(IN1, HIGH); digitalWrite(IN2, HIGH); digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);  break;
-      case 6: digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);  break;
-      case 7: digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); break;
-      default:digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);  digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);  break;
+// ================== PID related variables ==================
+float filterAlpha = 0.9;     // exponential filter factor (aka "magic" number)
+float pidKp = 15;
+float pidKi = 15;
+float pidKd = 0.3;
+
+float filteredPvValue = 0.0; // filtered process variable
+float pidIntegralAccum = 0.0;
+
+int speedSetpoint = 0;       // desired motor "speed" from remote
+
+int motorBackEmfPin1 = 0;
+int motorBackEmfPin2 = 0;
+
+float prevMotorBackEmfPin1 = 0.0;
+float prevMotorBackEmfPin2 = 0.0;
+float prevFilteredPvValue = 0.0;
+
+float pidOutputLimited = 0.0; // final PID signal after constrain()
+float motorPwmOutput = 0.0;   // what we actually send to EN pin
+
+// ================== button / motor control flags ==================
+bool motorDirectionClockwise = 0;  // 0 = one way, 1 = the other way, we forgot which lol
+bool pidControlEnabled = 1;        // 1 = PID mode, 0 = manual mode
+bool motorIsEnabled = 1;           // master motor enable
+bool lastPidToggleState = 1;       // last known PID enable state (for RF toggle)
+
+// ================== nRF24L01 radio config ==================
+RF24 wirelessRadioModule(7, 8);           // CE, CSN (hardwired in lab kit)
+const byte radioPipeAddress[6] = "P2U80"; // don't touch, this just works
+
+char rxPayloadBuffer[10] = {0};           // incoming data from transmitter (string-ish)
+int ackPayloadArray[4] = {0, 0, 0, 0};    // data we send back as ACK (basic telemetry)
+
+// ================== LCD config ==================
+LiquidCrystal_I2C statusLcd(LCD_ADDRESS, 16, 2);  // tiny 16x2 but we try our best
+
+void setup() {
+    Serial.begin(9600);
+
+    pinMode(buttonStartPin, INPUT_PULLUP);
+    pinMode(buttonPidPin, INPUT_PULLUP);
+    pinMode(buttonStopPin, INPUT_PULLUP);
+
+    pinMode(motorIn1Pin, OUTPUT);
+    pinMode(motorIn2Pin, OUTPUT);
+    pinMode(motorEnablePin, OUTPUT);
+
+    // ===== nRF24 setup =====
+    wirelessRadioModule.begin();
+    wirelessRadioModule.setDataRate(RF24_250KBPS); // slow but "reliable" (in theory)
+    wirelessRadioModule.openReadingPipe(1, radioPipeAddress);
+    wirelessRadioModule.enableAckPayload();
+    wirelessRadioModule.startListening();
+    wirelessRadioModule.writeAckPayload(1, &ackPayloadArray, sizeof(ackPayloadArray));
+
+    // ===== LCD setup =====
+    statusLcd.init();
+    statusLcd.backlight(); // because we like seeing things
+}
+
+void loop() {
+
+    // ================== read TX payload from remote ==================
+    if (wirelessRadioModule.available())
+    {
+        while (wirelessRadioModule.available()) {
+            // keep reading until we get the latest payload
+            wirelessRadioModule.read(&rxPayloadBuffer, sizeof(rxPayloadBuffer));
+        }
+        // Serial.println(rxPayloadBuffer); // uncomment if you wanna spam serial monitor
+
+        // ----- PID ON/OFF toggle -----
+        if (rxPayloadBuffer[0] == 'M' && lastPidToggleState == 1)
+        {
+            // go to manual mode
+            pidControlEnabled = 0;
+            lastPidToggleState = 0;
+        }
+        else if (rxPayloadBuffer[0] == 'S' && lastPidToggleState == 0)
+        {
+            // go back to PID mode
+            pidControlEnabled = 1;
+            lastPidToggleState = 1;
+        }
+
+        // ----- motor direction + enable from remote -----
+        if (rxPayloadBuffer[2] == 'W')
+        {
+            motorDirectionClockwise = 0;
+            motorIsEnabled = 1;
+        }
+        else if (rxPayloadBuffer[2] == 'Z')
+        {
+            motorDirectionClockwise = 1;
+            motorIsEnabled = 1;
+        }
+        else if (rxPayloadBuffer[2] == 'E')
+        {
+            motorIsEnabled = 0;
+        }
+
+        // ----- setpoint from payload (starting at index 4 as a string) -----
+        speedSetpoint = atoi(&rxPayloadBuffer[4]); // yeah, we're trusting this string
     }
 
-    // Move the step index
-    if (direction) Steps++;
-    else Steps--;
-    if (Steps > 7) Steps = 0;
-    if (Steps < 0) Steps = 7;
+    // ================== build ACK payload back to TX ==================
+    ackPayloadArray[0] = (int)dhtTemperatureF;      // temp
+    ackPayloadArray[1] = ldrLightReading;          // light
+    ackPayloadArray[2] = dhtHumidityPercent;       // humidity
+    ackPayloadArray[3] = (int)filteredPvValue;     // motor "speed" feedback (ish)
+    wirelessRadioModule.writeAckPayload(1, &ackPayloadArray, sizeof(ackPayloadArray));
 
-    delayMicroseconds(delayUs);
-  }
-}
+    // ================== motor direction + enable control ==================
+    if (motorIsEnabled)
+    {
+        if (motorDirectionClockwise) { // flip this if the motor goes backwards IRL
+            digitalWrite(motorIn2Pin, HIGH);
+            digitalWrite(motorIn1Pin, LOW);
+        }
+        else
+        {
+            digitalWrite(motorIn2Pin, LOW);
+            digitalWrite(motorIn1Pin, HIGH);
+        }
+    }
+    else
+    {
+        // fully stop motor
+        digitalWrite(motorIn2Pin, LOW);
+        digitalWrite(motorIn1Pin, LOW);
+    }
 
+    unsigned long currentMillisTime = millis();
 
-void runStepperStop() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-}
+    // ================== button debounce + logic ==================
+    if (currentMillisTime - lastButtonTimestamp >= buttonSampleTimeMs) {
+        // we only check buttons every 50 ms to avoid them being drama queens
+        if (!digitalRead(buttonStartPin))
+        {
+            lastButtonTimestamp += buttonSampleTimeMs;
+            motorIsEnabled = 1; // go brrr
+        }
+        else if (!digitalRead(buttonStopPin))
+        {
+            lastButtonTimestamp += buttonSampleTimeMs;
+            motorIsEnabled = 0; // no brrr
+        }
+        else if (!digitalRead(buttonPidPin))
+        {
+            lastButtonTimestamp += buttonSampleTimeMs;
+            lastPidToggleState = pidControlEnabled;
+            pidControlEnabled = !pidControlEnabled; // manual <-> PID
+        }
+    }
 
+    // ================== PID control loop (motor speed control) ==================
+    if (currentMillisTime - lastPidTimestamp >= pidSampleTimeMs) {
+        lastPidTimestamp += pidSampleTimeMs;
 
-void setup(){
-  Serial.begin(115200);
+        // briefly turn off motor so we can read Back-EMF (this feels illegal but it's fine)
+        analogWrite(motorEnablePin, LOW);
+        delay(2);  // tiny delay so driver settles
 
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
+        int rawMotorBackEmfPin1 = map(analogRead(A0), 0, 1023, 0, 255);
+        int rawMotorBackEmfPin2 = map(analogRead(A1), 0, 1023, 0, 255);
 
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
+        // turn motor back on with last PWM
+        analogWrite(motorEnablePin, motorPwmOutput);
 
-  lcd.setCursor(0,0); lcd.print("Motor Init");
-  Serial.println("Motor Init");
+        // filter measurements because they are super noisy
+        motorBackEmfPin1 = filterAlpha * prevMotorBackEmfPin1 + (1 - filterAlpha) * rawMotorBackEmfPin1;
+        motorBackEmfPin2 = filterAlpha * prevMotorBackEmfPin2 + (1 - filterAlpha) * rawMotorBackEmfPin2;
 
-  // Initialize the Radio ONCE
-  if (!radio.begin()) {
-    Serial.println("Radio NC");
-    lcd.setCursor(0, 0); lcd.print("Radio NC");
-    while (1) {}
-  }
+        filteredPvValue = (motorDirectionClockwise) ? motorBackEmfPin1 : motorBackEmfPin2;
+        prevFilteredPvValue = (motorDirectionClockwise) ? prevMotorBackEmfPin1 : prevMotorBackEmfPin2;
 
-  radio.setDataRate(RF24_250KBPS);
-  radio.setPALevel(RF24_PA_LOW);
-  radio.setChannel(108);                    // <-- MATCH TX channel
-  radio.openReadingPipe(1, address);
-  radio.startListening();
+        // ===== PID math from Lab 6 (rewritten with more panicking) =====
+        float pidError = (float)speedSetpoint - filteredPvValue;
+        float pidProportional = pidKp * pidError;
 
-  delay(350);
-  lcd.setCursor(0,1); lcd.print("Listening..." );
-}
+        // integrate error over time
+        pidIntegralAccum = pidIntegralAccum + pidKi * (pidSampleTimeMs / 1000.0) * pidError;
 
-void loop(){
-  bool got = false;
+        // derivative on measurement (less noisy they said…)
+        float pidDerivative = -pidKd * (filteredPvValue - prevFilteredPvValue) / (pidSampleTimeMs / 1000.0);
 
-  // Drain FIFO; keep last byte
-  while (radio.available()) {
-    radio.read(&payload, sizeof(payload));
-    got = true;
-    lastRx = millis();
-  }
+        prevMotorBackEmfPin1 = motorBackEmfPin1;
+        prevMotorBackEmfPin2 = motorBackEmfPin2;
 
-  // --- Only update when a new command arrives ---
-  if (got) {
-    s
-  }
+        float pidUnsaturatedOutput = pidProportional + pidIntegralAccum + pidDerivative;
 
-  // --- Always act on the current latched state ---
-  switch(currentState){
-    case IDLE:
-      Serial.println("IDLE");
-      lcd.setCursor(0, 0); lcd.print("TX Received!   ");
-      lcd.setCursor(0, 1); lcd.print("Motor: IDLING  ");
-      break;
+        // clamp output to valid PWM range
+        pidOutputLimited = constrain(pidUnsaturatedOutput, 0, 255);
 
-    case FWD:
-      Serial.println("FWD");
-      lcd.setCursor(0, 0); lcd.print("TX Received!   ");
-      lcd.setCursor(0, 1); lcd.print("Motor: FWD 100%");
-      runStepper(true);
-      break;
+        // anti-windup: undo integral if we're stuck at a limit
+        if ((pidOutputLimited == 255 && pidError > 0) || (pidOutputLimited == 0 && pidError < 0)) {
+            pidIntegralAccum -= pidKi * (pidSampleTimeMs / 1000.0) * pidError;
+        }
 
-    case BWD:
-      Serial.println("BWD");
-      lcd.setCursor(0, 0); lcd.print("TX Received!   ");
-      lcd.setCursor(0, 1); lcd.print("Motor: BWD 100%");
-      runStepper(false);
-      break;
+        // if PID is enabled, use PID output; else go full "manual override"
+        if (pidControlEnabled)
+        {
+            motorPwmOutput = pidOutputLimited;
+        }
+        else
+        {
+            motorPwmOutput = speedSetpoint; // direct control from remote (pls be careful)
+        }
 
-    case STOP:
-      Serial.println("STOP");
-      lcd.setCursor(0, 0); lcd.print("TX Received!   ");
-      lcd.setCursor(0, 1); lcd.print("Motor: STOPPED ");
-      runStepperStop();
-      break;
+        analogWrite(motorEnablePin, motorPwmOutput);
+    }
 
-    default:
-      Serial.println(payload);
-      lcd.setCursor(0, 0); lcd.print("TX Received!   ");
-      lcd.setCursor(0, 1); lcd.print("Bad CMD!STOP!  ");
-      runStepperStop();
-      break;
-  }
+    // ================== LCD + sensor display stuff ==================
+    if (currentMillisTime - lastDisplayTimestamp >= displayRefreshTimeMs)
+    {
+        lastDisplayTimestamp += displayRefreshTimeMs;
 
-  // --- Optional: comment out link-loss to hold state forever ---
-  /*
-  if (millis() - lastRx > rxTimeoutMs) {
-    lcd.setCursor(0, 0); lcd.print("NO TX Received ");
-    lcd.setCursor(0, 1); lcd.print("MOTOR: STOPPED ");
-  }
-  */
+        // --- read DHT11 (temp + humidity) ---
+        // yes this blocks a tiny bit but it's lab code so it's fine
+        myDht11Sensor.readTemperatureHumidity(dhtTemperatureF, dhtHumidityPercent);
+
+        // --- read LDR (aka "how bright is it") ---
+        ldrLightReading = analogRead(ldrAnalogPin);
+
+        // --- update LCD content ---
+        statusLcd.setCursor(0, 0);
+        statusLcd.print("M:");
+
+        // print mode
+        statusLcd.print((pidControlEnabled) ? "PID    " : "Manual ");
+
+        statusLcd.setCursor(11, 0);
+        statusLcd.print("T:");
+        statusLcd.print(dhtTemperatureF);
+
+        statusLcd.setCursor(0, 1);
+        statusLcd.print("S:");
+        statusLcd.print(speedSetpoint);
+        statusLcd.print(" ");
+
+        statusLcd.setCursor(6, 1);
+        statusLcd.print("P:");
+        statusLcd.print((int)motorPwmOutput);
+        statusLcd.print(" ");
+
+        statusLcd.print("H:");
+        statusLcd.print(dhtHumidityPercent);
+
+        // statusLcd.print(rxPayloadBuffer);   // debug, if we ever need it again
+        // Serial.println(rxPayloadBuffer);    // same deal
+
+        // spam some useful stuff to serial monitor for debugging
+        Serial.print("Temp (F): ");
+        Serial.println(dhtTemperatureF);
+        Serial.print("Humidity (%): ");
+        Serial.println(dhtHumidityPercent);
+    }
 }
